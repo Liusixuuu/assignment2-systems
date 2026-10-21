@@ -20,6 +20,20 @@ def nvtx_range(name: str, enabled: bool):
         yield
 
 
+def add_block_nvtx_ranges(blocks) -> None:
+    """Wrap each block's forward and backward in an NVTX range ("block_{i}" / "block_{i}_bwd").
+
+    Lets Nsight attribute allocations (residuals saved in forward, gradients produced in
+    backward) to a single TransformerBlock. Backward hooks fire on the autograd thread,
+    which is fine for NVTX since push/pop for a block happen on the same thread.
+    """
+    for i, block in enumerate(blocks):
+        block.register_forward_pre_hook(lambda m, inp, i=i: nvtx.range_push(f"block_{i}"))
+        block.register_forward_hook(lambda m, inp, out: nvtx.range_pop())
+        block.register_full_backward_pre_hook(lambda m, grad_out, i=i: nvtx.range_push(f"block_{i}_bwd"))
+        block.register_full_backward_hook(lambda m, grad_in, grad_out: nvtx.range_pop())
+
+
 def stats_ms(times_ms):
     mean = stats.mean(times_ms)
     std = stats.pstdev(times_ms) if len(times_ms) > 1 else 0.0
@@ -33,6 +47,7 @@ class BenchmarkRow:
     context_length: int
     vocab_size: int
     amp: str
+    mode: str           # "forward", "forward_backward", "train"
     device: str
     phase: str          # e.g. "forward", "backward", "optimizer"
     mean_ms: float
@@ -40,6 +55,9 @@ class BenchmarkRow:
     tok_s: float
     num_warmups: int
     num_measures: int
+    peak_mem_mib: float | None = None   # torch.cuda.max_memory_allocated over the measured steps
+    checkpoint: str = "0"               # blocks per checkpoint group, "0" = off, or "recursive"
+    compile: bool = False               # whole model wrapped in torch.compile
 
 
 class BenchmarkReporter:
@@ -78,6 +96,8 @@ class BenchmarkReporter:
 
 
 def _fmt(v) -> str:
+    if v is None:
+        return "-"
     if isinstance(v, float):
         return f"{v:.3f}" if abs(v) < 1e4 else f"{v:.1f}"
     return str(v)
